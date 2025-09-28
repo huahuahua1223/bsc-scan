@@ -14,8 +14,8 @@ const { BloomFilter } = bloomPkg;
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
 const START_BLOCK = Number(process.env.START_BLOCK ?? 0);
 const END_BLOCK   = Number(process.env.END_BLOCK   ?? 500_000);
-const BLOCK_STEP  = Number(process.env.BLOCK_STEP  || 5000); // 默认5000个区块一次
-const ADDRESS_CHUNK = Number(process.env.ADDRESS_CHUNK || 10);
+const BLOCK_STEP  = Number(process.env.BLOCK_STEP  || 2000); // 减少到2000个区块一次
+const ADDRESS_CHUNK = Number(process.env.ADDRESS_CHUNK || 1);  // 减少到1个地址一次
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 40);
 const USD_THRESHOLD = Number(process.env.USD_THRESHOLD || 100);
 const ROW_LIMIT = Number(process.env.ROW_LIMIT || 5_000_000);
@@ -29,9 +29,17 @@ const TARGET_END_RAW = process.env.TARGET_END || "62530100";
 const TOKENS_CSV = process.env.TOKENS_CSV || "./token_withbalance.csv";
 const BLOOM_JSON = process.env.BLOOM_JSON || "./userlist.bloom.json";
 const PROGRESS_FILE = process.env.PROGRESS_FILE || "./scan_progress.json";
-const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // 每100个窗口保存一次进度
+const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // 每50个批次保存一次进度
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5); // 最大重试次数
 const RETRY_DELAY_BASE = Number(process.env.RETRY_DELAY_BASE || 1000); // 重试延迟基数（毫秒）
+
+// 动态调整参数
+let currentBlockStep = BLOCK_STEP;
+let currentAddressChunk = ADDRESS_CHUNK;
+const MIN_BLOCK_STEP = 500;  // 最小区块步长
+const MIN_ADDRESS_CHUNK = 1; // 最小地址批次
+let consecutiveTimeouts = 0;  // 连续超时计数
+const REQUEST_DELAY = Number(process.env.REQUEST_DELAY || 100); // 请求间隔（毫秒）
 
 // ==== 流式读取 Token 数据 ====
 const TOKENS = {};
@@ -72,7 +80,16 @@ const bsc = defineChain({
   nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
   rpcUrls: { default: { http: [RPC_HTTP] } },
 });
-const client = createPublicClient({ chain: bsc, transport: http(RPC_HTTP) });
+
+// 配置更长的超时时间和重试机制
+const client = createPublicClient({ 
+  chain: bsc, 
+  transport: http(RPC_HTTP, {
+    timeout: 60_000, // 60秒超时
+    retryCount: 3,   // transport层重试3次
+    retryDelay: 2000 // 重试间隔2秒
+  })
+});
 const transferEvent = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 );
@@ -186,12 +203,41 @@ function cleanupProgress() {
   }
 }
 
+// ==== 动态调整机制 ====
+function adjustBatchSizeOnTimeout() {
+  consecutiveTimeouts++;
+  console.log(`[调整] 检测到超时错误，连续超时次数: ${consecutiveTimeouts}`);
+  
+  if (consecutiveTimeouts >= 2) {
+    // 减少地址批次大小
+    if (currentAddressChunk > MIN_ADDRESS_CHUNK) {
+      currentAddressChunk = Math.max(MIN_ADDRESS_CHUNK, Math.floor(currentAddressChunk / 2));
+      console.log(`[调整] 地址批次大小调整为: ${currentAddressChunk}`);
+    }
+    
+    // 减少区块步长
+    if (currentBlockStep > MIN_BLOCK_STEP && consecutiveTimeouts >= 3) {
+      currentBlockStep = Math.max(MIN_BLOCK_STEP, Math.floor(currentBlockStep / 2));
+      console.log(`[调整] 区块步长调整为: ${currentBlockStep}`);
+    }
+  }
+}
+
+function resetTimeoutCounter() {
+  if (consecutiveTimeouts > 0) {
+    console.log(`[调整] 请求成功，重置超时计数器`);
+    consecutiveTimeouts = 0;
+  }
+}
+
 // ==== 增强的重试机制 ====
 async function withRetry(fn, label, max = MAX_RETRIES) {
   let err;
   for (let i = 0; i < max; i++) {
     try { 
-      return await fn(); 
+      const result = await fn();
+      resetTimeoutCounter(); // 成功时重置超时计数器
+      return result;
     } catch (e) {
       err = e;
       const delay = RETRY_DELAY_BASE * Math.pow(2, i); // 指数退避
@@ -200,13 +246,16 @@ async function withRetry(fn, label, max = MAX_RETRIES) {
       
       console.warn(`[重试 ${i + 1}/${max}] ${label}: ${e?.message || e}; 等待 ${Math.round(totalDelay)}ms`);
       
-      // 特殊错误处理
-      if (e?.message?.includes('rate limit') || e?.code === 429) {
-        await new Promise(r => setTimeout(r, totalDelay * 2)); // 速率限制时等待更长时间
-      } else if (e?.message?.includes('timeout')) {
-        await new Promise(r => setTimeout(r, totalDelay));
-      } else if (e?.message?.includes('connection')) {
-        await new Promise(r => setTimeout(r, totalDelay * 1.5)); // 连接问题时等待稍长时间
+      // 检测超时错误并调整批次大小
+      if (e?.message?.includes('timeout') || e?.message?.includes('took too long')) {
+        adjustBatchSizeOnTimeout();
+        await new Promise(r => setTimeout(r, totalDelay * 2)); // 超时错误等待更长时间
+      } else if (e?.message?.includes('rate limit') || e?.code === 429) {
+        await new Promise(r => setTimeout(r, totalDelay * 3)); // 速率限制时等待更长时间
+      } else if (e?.message?.includes('connection') || e?.message?.includes('ECONNRESET')) {
+        await new Promise(r => setTimeout(r, totalDelay * 2)); // 连接问题时等待更长时间
+      } else if (e?.message?.includes('server') || e?.code >= 500) {
+        await new Promise(r => setTimeout(r, totalDelay * 1.5)); // 服务器错误
       } else {
         await new Promise(r => setTimeout(r, totalDelay));
       }
@@ -330,7 +379,7 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
 
       // 计算总窗口数（用于进度显示）
       if (targetEnd > nextStart) {
-        totalWindows = Math.ceil(Number(targetEnd - nextStart + 1n) / BLOCK_STEP);
+        totalWindows = Math.ceil(Number(targetEnd - nextStart + 1n) / currentBlockStep);
       } else {
         totalWindows = 0;
       }
@@ -346,15 +395,16 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
         continue;
       }
 
-      const windowEnd = nextStart + BigInt(BLOCK_STEP - 1) <= targetEnd
-        ? nextStart + BigInt(BLOCK_STEP - 1)
+      const windowEnd = nextStart + BigInt(currentBlockStep - 1) <= targetEnd
+        ? nextStart + BigInt(currentBlockStep - 1)
         : targetEnd;
 
-      const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / BLOCK_STEP) + 1;
+      const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / currentBlockStep) + 1;
       console.log(`[扫描] 窗口 ${currentWindow}/${totalWindows} - 区块 ${nextStart}-${windowEnd} (head=${head})`);
+      console.log(`[参数] 当前区块步长: ${currentBlockStep}, 地址批次: ${currentAddressChunk}`);
 
       // === 按地址分片 getLogs → 写 CSV ===
-      const addrBatches = chunks(TOKEN_ADDRESSES, ADDRESS_CHUNK);
+      const addrBatches = chunks(TOKEN_ADDRESSES, currentAddressChunk);
       let startBatch = (nextStart === savedProgress?.nextStart) ? resumeFromBatch : 1;
       
       for (let batchIndex = startBatch - 1; batchIndex < addrBatches.length; batchIndex++) {
@@ -407,6 +457,11 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           // 定期保存进度
           if (batchCount % CHECKPOINT_INTERVAL === 0) {
             saveProgress(nextStart, batchCount, totalWindows, targetEnd);
+          }
+          
+          // 添加请求间隔，避免过于频繁的请求
+          if (REQUEST_DELAY > 0 && batchIndex < addrBatches.length - 1) {
+            await new Promise(r => setTimeout(r, REQUEST_DELAY));
           }
           
         } catch (error) {
