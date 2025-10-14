@@ -1,14 +1,20 @@
 // scan_bloom.mjs
-// 运行：START_BLOCK=0 END_BLOCK=500000 RPC_HTTP=http://127.0.0.1:8545 node scan_bloom.mjs
+// BSC 扫描：提取 ERC20 Transfer，并在输出前"from/to 仅保留 EOA"
+// 运行：START_BLOCK=0 TARGET_END=latest RPC_HTTP=http://127.0.0.1:8545 node scan_bloom.mjs
 
-import { createPublicClient, http, parseAbiItem } from "viem";
+import { createPublicClient, http, parseAbiItem, getAddress } from "viem";
 import { defineChain } from "viem/utils";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from 'url';
 import { parse } from "csv-parse";
 import csv from "fast-csv";
 import bloomPkg from "bloom-filters";
+import { makeEOAChecker } from './eoa.mjs';
+
 const { BloomFilter } = bloomPkg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ==== 参数 ====
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
@@ -93,6 +99,12 @@ const client = createPublicClient({
 const transferEvent = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 );
+
+// ==== EOA Checker 初始化 ====
+const { isEOAAtBlock } = makeEOAChecker(client, {
+  blockBucket: 50_000,  // 以 5 万区块为粒度做历史缓存
+  maxCache: 200_000,    // 最大缓存条目数
+});
 
 // ==== 输出：按 5,000,000 行/文件 自动切分 ====
 const outDir = "./output";
@@ -425,6 +437,7 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           let validLogs = 0;
           let bloomHits = 0;
           let usdFiltered = 0;
+          let eoaFiltered = 0;
           
           // 流式处理日志
           for (const log of logs) {
@@ -436,6 +449,15 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             const u = usd(log.address, value);
             if (u == null || u < USD_THRESHOLD) continue;
             usdFiltered++;
+
+            // ★★★★★ 关键过滤：from/to 只保留 EOA（任一侧非 EOA，则跳过）
+            const bn = log.blockNumber;
+            const [fromIsEOA, toIsEOA] = await Promise.all([
+              isEOAAtBlock(from, bn),
+              isEOAAtBlock(to, bn),
+            ]);
+            if (!fromIsEOA || !toIsEOA) continue;
+            eoaFiltered++;
 
             await writeRow({
               tx_hash: log.transactionHash,
@@ -451,7 +473,7 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           }
           
           if (logs.length > 0) {
-            console.log(`    [结果] 原始日志: ${logs.length}, Bloom命中: ${bloomHits}, USD过滤后: ${usdFiltered}, 有效记录: ${validLogs}`);
+            console.log(`    [结果] 原始日志: ${logs.length}, Bloom命中: ${bloomHits}, USD过滤: ${usdFiltered}, EOA过滤: ${eoaFiltered}, 有效记录: ${validLogs}`);
           }
           
           // 定期保存进度
