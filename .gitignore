@@ -34,6 +34,7 @@ userlist.bloom.json
 # 进度文件（运行时生成）
 scan_progress.json
 *.progress.json
+failed_batches.json
 
 # 临时文件
 temp/
