@@ -18,7 +18,7 @@ const __dirname = path.dirname(__filename);
 
 // ==== 参数 ====
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
-const START_BLOCK = Number(process.env.START_BLOCK ?? 0);
+const START_BLOCK = Number(process.env.START_BLOCK ?? 6000000);
 const END_BLOCK   = Number(process.env.END_BLOCK   ?? 500_000);
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 40);
 const ROW_LIMIT = Number(process.env.ROW_LIMIT || 5_000_000);
@@ -35,19 +35,20 @@ const INCLUDE_BLOCK_TS = String(process.env.INCLUDE_BLOCK_TS || "0") === "0"; //
 // 自适应步长调整阈值
 const STEP_ADJUST_TIME_THRESHOLD = Number(process.env.STEP_ADJUST_TIME_MS || 3600000); // 1小时 = 3600000ms
 const STEP_ADJUST_LOGS_THRESHOLD = Number(process.env.STEP_ADJUST_LOGS || 500000); // 50万条日志
+const STEP_ADJUST_WINDOW_COUNT = Number(process.env.STEP_ADJUST_WINDOW_COUNT || 20); // 每20个窗口检查一次步长调整
 
 // === 新增：追块&终点 ===
 const FOLLOW_LATEST = String(process.env.FOLLOW_LATEST || "0") === "1"; // 扫完一轮后是否继续追新块
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 15000); // 追块时每轮睡眠（15秒）
 // TARGET_END 可以是整数区块号，或 "latest"（默认）
-const TARGET_END_RAW = process.env.TARGET_END || "62530100";
+const TARGET_END_RAW = process.env.TARGET_END || "6244000";
 
 const TOKENS_CSV = process.env.TOKENS_CSV || "./token_withbalance.csv";
 const BLOOM_JSON = process.env.BLOOM_JSON || "./userlist.bloom.json";
 const PROGRESS_FILE = process.env.PROGRESS_FILE || "./scan_progress.json";
 const FAILED_BATCHES_FILE = process.env.FAILED_BATCHES_FILE || "./failed_batches.json"; // 失败批次记录文件
 const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // 每50个批次保存一次进度
-const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5); // 最大重试次数
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3); // 最大重试次数
 const RETRY_DELAY_BASE = Number(process.env.RETRY_DELAY_BASE || 1000); // 重试延迟基数（毫秒）
 
 // 动态调整参数（保留旧逻辑兼容）
@@ -355,62 +356,17 @@ async function withRetry(fn, label, max = MAX_RETRIES) {
 }
 
 // ==== 带步长回退的批次重试机制 ====
-async function retryBatchWithStepBackoff(batchFn, blockRange, batchNum, addressCount, originalStep) {
-  let currentStep = originalStep;
-  const testedSteps = []; // 记录尝试过的步长
+// 注意：这个函数现在直接跳过失败批次，不再进行步长回退
+// 步长调整将在窗口级别完成，而非批次级别
+async function skipFailedBatch(blockRange, batchNum, addressCount, error) {
+  console.error(`[批次失败] 批次 ${batchNum} (${blockRange}) 重试5次后失败`);
   
-  while (currentStep >= BLOCK_STEP_MIN) {
-    try {
-      console.log(`[批次重试] 尝试步长 ${currentStep} (原步长: ${originalStep}, 最小: ${BLOCK_STEP_MIN})`);
-      testedSteps.push(currentStep);
-      
-      // 临时修改全局步长用于此批次
-      const savedStep = BLOCK_STEP;
-      BLOCK_STEP = currentStep;
-      
-      try {
-        const result = await batchFn();
-        BLOCK_STEP = savedStep; // 恢复步长
-        
-        // 成功后，如果步长被调整过，更新全局步长为成功的步长
-        if (currentStep < originalStep) {
-          console.log(`[步长调整] 批次成功，将步长从 ${savedStep} 调整为 ${currentStep}`);
-        }
-        
-        return result; // 成功返回
-      } catch (e) {
-        BLOCK_STEP = savedStep; // 确保恢复步长
-        throw e;
-      }
-      
-    } catch (error) {
-      console.error(`[批次重试失败] 步长 ${currentStep} 失败: ${error.message}`);
-      
-      // 记录尝试过的步长
-      updateFailedBatchSteps(blockRange, batchNum, currentStep);
-      
-      // 步长减半，继续重试
-      const nextStep = Math.floor(currentStep / 2);
-      
-      if (nextStep < BLOCK_STEP_MIN) {
-        // 已经到达最小步长，仍然失败
-        console.error(`[批次放弃] 已尝试所有步长 [${testedSteps.join(', ')}]，最终失败`);
-        
-        // 记录失败批次
-        saveFailedBatch(blockRange, batchNum, addressCount, error);
-        
-        return null; // 返回 null 表示失败，需要跳过
-      }
-      
-      currentStep = nextStep;
-      console.log(`[步长回退] 减小步长到 ${currentStep}，继续重试...`);
-      
-      // 等待一段时间后再重试
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
+  // 记录失败批次
+  saveFailedBatch(blockRange, batchNum, addressCount, error);
   
-  return null; // 不应该到这里，但以防万一
+  console.warn(`[跳过] 该批次已记录到失败列表，继续处理下一个批次`);
+  
+  return null; // 返回 null 表示失败，需要跳过
 }
 
 // ==== 健康检查和自动恢复 ====
@@ -430,6 +386,10 @@ let nextStart = BigInt(START_BLOCK);
 let totalWindows = 0;
 let currentBatch = 1;
 let targetEnd = BigInt(0);
+
+// ==== 步长调整统计 ====
+let windowsProcessed = 0; // 已处理窗口数
+let windowStats = []; // 窗口统计数据：{ time, logs }
 
 process.on('SIGINT', async () => {
   if (isShuttingDown) {
@@ -592,15 +552,14 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           // 首先尝试正常处理
           logs = await processBatch();
         } catch (error) {
-          // 如果正常重试失败，启用步长回退机制
-          console.warn(`[批次失败] 批次 ${batchNum} 常规重试失败，启用步长回退机制`);
+          // 如果正常重试失败，直接跳过该批次
+          console.warn(`[批次失败] 批次 ${batchNum} 常规重试失败，跳过该批次`);
           
-          const result = await retryBatchWithStepBackoff(
-            processBatch,
+          const result = await skipFailedBatch(
             blockRange,
             batchNum,
             addrBatch.length,
-            BLOCK_STEP
+            error
           );
           
           if (result === null) {
@@ -719,25 +678,44 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
       
       const dt = Date.now() - t0;
       
-      // ★★★★★ 自适应步长调整（激进策略）
-      const dtSeconds = Math.round(dt / 1000);
-      const dtMinutes = Math.round(dt / 60000);
+      // 记录窗口统计
+      windowsProcessed++;
+      windowStats.push({ time: dt, logs: totalLogs });
       
-      if (dt > STEP_ADJUST_TIME_THRESHOLD || totalLogs > STEP_ADJUST_LOGS_THRESHOLD) {
-        // 耗时超过1小时 或 日志超过50万条 → 步长减半
-        const oldStep = BLOCK_STEP;
-        BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
-        console.log(`[调整] 区块步长减半 ${oldStep} -> ${BLOCK_STEP} (耗时${dtMinutes}分钟, 日志${totalLogs.toLocaleString()}条)`);
-      } else if (dt < STEP_ADJUST_TIME_THRESHOLD && totalLogs < STEP_ADJUST_LOGS_THRESHOLD) {
-        // 耗时少于1小时 且 日志少于50万条 → 步长增加25%
-        const oldStep = BLOCK_STEP;
-        BLOCK_STEP = Math.min(BLOCK_STEP_MAX, Math.floor(BLOCK_STEP * 1.25));
-        if (BLOCK_STEP !== oldStep) {
-          console.log(`[调整] 区块步长增加 ${oldStep} -> ${BLOCK_STEP} (耗时${dtSeconds}秒, 日志${totalLogs.toLocaleString()}条)`);
-        }
+      // 只保留最近 STEP_ADJUST_WINDOW_COUNT 个窗口的统计
+      if (windowStats.length > STEP_ADJUST_WINDOW_COUNT) {
+        windowStats.shift();
       }
       
+      const dtSeconds = Math.round(dt / 1000);
       console.log(`[完成] 区块 ${nextStart}-${windowEnd} 处理完毕 | logs=${totalLogs.toLocaleString()} wrote=${wrote} dt=${dtSeconds}s`);
+      
+      // ★★★★★ 自适应步长调整（每15个窗口检查一次）
+      if (windowsProcessed % STEP_ADJUST_WINDOW_COUNT === 0 && windowStats.length === STEP_ADJUST_WINDOW_COUNT) {
+        // 计算最近15个窗口的平均耗时和日志数
+        const avgTime = windowStats.reduce((sum, s) => sum + s.time, 0) / windowStats.length;
+        const avgLogs = windowStats.reduce((sum, s) => sum + s.logs, 0) / windowStats.length;
+        const avgMinutes = Math.round(avgTime / 30000);
+        const avgSeconds = Math.round(avgTime / 1000);
+        
+        console.log(`[统计] 最近${STEP_ADJUST_WINDOW_COUNT}个窗口 - 平均耗时: ${avgSeconds}秒, 平均日志: ${Math.round(avgLogs).toLocaleString()}条`);
+        
+        if (avgTime > STEP_ADJUST_TIME_THRESHOLD || avgLogs > STEP_ADJUST_LOGS_THRESHOLD) {
+          // 平均耗时超过30分钟 或 平均日志超过50万条 → 步长减半
+          const oldStep = BLOCK_STEP;
+          BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
+          console.log(`[调整] 区块步长减半 ${oldStep} -> ${BLOCK_STEP} (平均${avgMinutes}分钟, ${Math.round(avgLogs).toLocaleString()}条日志)`);
+          windowStats = []; // 清空统计，重新开始
+        } else if (avgTime < STEP_ADJUST_TIME_THRESHOLD / 2 && avgLogs < STEP_ADJUST_LOGS_THRESHOLD / 2) {
+          // 平均耗时少于30分钟 且 平均日志少于25万条 → 步长增加25%
+          const oldStep = BLOCK_STEP;
+          BLOCK_STEP = Math.min(BLOCK_STEP_MAX, Math.floor(BLOCK_STEP * 1.25));
+          if (BLOCK_STEP !== oldStep) {
+            console.log(`[调整] 区块步长增加 ${oldStep} -> ${BLOCK_STEP} (平均${avgSeconds}秒, ${Math.round(avgLogs).toLocaleString()}条日志)`);
+            windowStats = []; // 清空统计，重新开始
+          }
+        }
+      }
       
       // 移动窗口起点
       nextStart = windowEnd + 1n;
