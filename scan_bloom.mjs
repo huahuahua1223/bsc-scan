@@ -1,5 +1,5 @@
 // scan_bloom.mjs
-// BSC 扫描：提取 ERC20 Transfer，并在输出前"from/to 仅保留 EOA"
+// BSC 扫描：提取 ERC-20 Transfer，并做 EOA-only + 各项提速优化
 // 运行：START_BLOCK=0 TARGET_END=latest RPC_HTTP=http://127.0.0.1:8545 node scan_bloom.mjs
 
 import { createPublicClient, http, parseAbiItem, getAddress } from "viem";
@@ -20,11 +20,21 @@ const __dirname = path.dirname(__filename);
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
 const START_BLOCK = Number(process.env.START_BLOCK ?? 0);
 const END_BLOCK   = Number(process.env.END_BLOCK   ?? 500_000);
-const BLOCK_STEP  = Number(process.env.BLOCK_STEP  || 2000); // 减少到2000个区块一次
-const ADDRESS_CHUNK = Number(process.env.ADDRESS_CHUNK || 1);  // 减少到1个地址一次
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 40);
-const USD_THRESHOLD = Number(process.env.USD_THRESHOLD || 100);
 const ROW_LIMIT = Number(process.env.ROW_LIMIT || 5_000_000);
+
+// ==== 提速优化参数 ====
+let   BLOCK_STEP      = Number(process.env.BLOCK_STEP || 2000);    // 自适应步长初始值
+const BLOCK_STEP_MIN  = Number(process.env.BLOCK_STEP_MIN || 1500); // 最小步长
+const BLOCK_STEP_MAX  = Number(process.env.BLOCK_STEP_MAX || 5000); // 最大步长
+const ADDRESS_CHUNK   = Number(process.env.ADDRESS_CHUNK || 10);   // address下推分片
+const USD_THRESHOLD   = Number(process.env.USD_THRESHOLD || 100);  // <$100早丢弃
+const EOA_ONLY        = String(process.env.EOA_ONLY || "1") === "1"; // 只保留EOA
+const INCLUDE_BLOCK_TS = String(process.env.INCLUDE_BLOCK_TS || "0") === "0"; // 是否查询块时间
+
+// 自适应步长调整阈值
+const STEP_ADJUST_TIME_THRESHOLD = Number(process.env.STEP_ADJUST_TIME_MS || 3600000); // 1小时 = 3600000ms
+const STEP_ADJUST_LOGS_THRESHOLD = Number(process.env.STEP_ADJUST_LOGS || 500000); // 50万条日志
 
 // === 新增：追块&终点 ===
 const FOLLOW_LATEST = String(process.env.FOLLOW_LATEST || "0") === "1"; // 扫完一轮后是否继续追新块
@@ -39,11 +49,7 @@ const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // �
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5); // 最大重试次数
 const RETRY_DELAY_BASE = Number(process.env.RETRY_DELAY_BASE || 1000); // 重试延迟基数（毫秒）
 
-// 动态调整参数
-let currentBlockStep = BLOCK_STEP;
-let currentAddressChunk = ADDRESS_CHUNK;
-const MIN_BLOCK_STEP = 500;  // 最小区块步长
-const MIN_ADDRESS_CHUNK = 1; // 最小地址批次
+// 动态调整参数（保留旧逻辑兼容）
 let consecutiveTimeouts = 0;  // 连续超时计数
 const REQUEST_DELAY = Number(process.env.REQUEST_DELAY || 100); // 请求间隔（毫秒）
 
@@ -87,10 +93,11 @@ const bsc = defineChain({
   rpcUrls: { default: { http: [RPC_HTTP] } },
 });
 
-// 配置更长的超时时间和重试机制
+// 配置更长的超时时间和重试机制 + HTTP批量优化
 const client = createPublicClient({ 
   chain: bsc, 
   transport: http(RPC_HTTP, {
+    batch: true,     // 批量JSON-RPC，降低往返延迟
     timeout: 60_000, // 60秒超时
     retryCount: 3,   // transport层重试3次
     retryDelay: 2000 // 重试间隔2秒
@@ -99,6 +106,7 @@ const client = createPublicClient({
 const transferEvent = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 );
+
 
 // ==== EOA Checker 初始化 ====
 const { isEOAAtBlock } = makeEOAChecker(client, {
@@ -116,7 +124,7 @@ let current; // { path, stream, writer }
 
 function openNewPart() {
   const filePath = path.join(outDir, `edge_events_part${part}.csv`);
-  const stream = fs.createWriteStream(filePath, { flags: "w" }); // 新建并覆盖
+  const stream = fs.createWriteStream(filePath, { flags: "w", highWaterMark: 32 * 1024 * 1024 }); // 高水位缓冲32MB
   const writer = csv.format({ headers: true });                 // 每个分片都写表头
   writer.pipe(stream);
   return { path: filePath, stream, writer };
@@ -170,6 +178,37 @@ async function ts(bn) {
   return t;
 }
 
+// ==== 提速优化工具函数 ====
+// 高水位缓冲写入流
+function onceDrain(ws) {
+  if (ws.writableNeedDrain) return new Promise(r => ws.once('drain', r));
+  return Promise.resolve();
+}
+
+// 并行执行（限制并发数）
+async function pMap(items, worker, concurrency = 4) {
+  const ret = [];
+  let i = 0;
+  let active = 0;
+  return new Promise((resolve, reject) => {
+    const next = () => {
+      while (active < concurrency && i < items.length) {
+        const cur = items[i++];
+        active++;
+        Promise.resolve(worker(cur))
+          .then((r) => {
+            ret.push(r);
+            active--;
+            next();
+          })
+          .catch(reject);
+      }
+      if (i >= items.length && active === 0) resolve(ret);
+    };
+    next();
+  });
+}
+
 // ==== 断点续传相关函数 ====
 function saveProgress(nextStart, currentBatch, totalWindows, targetEnd) {
   const progress = {
@@ -180,11 +219,12 @@ function saveProgress(nextStart, currentBatch, totalWindows, targetEnd) {
     startBlock: START_BLOCK,
     targetEnd: targetEnd.toString(),
     part,
-    rowsInPart
+    rowsInPart,
+    blockStep: BLOCK_STEP // 保存当前步长
   };
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress, null, 2));
   const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / BLOCK_STEP) + 1;
-  console.log(`[进度保存] 区块 ${nextStart}, 窗口 ${currentWindow}/${totalWindows}, 批次 ${currentBatch}`);
+  console.log(`[进度保存] 区块 ${nextStart}, 窗口 ${currentWindow}/${totalWindows}, 批次 ${currentBatch}, 步长 ${BLOCK_STEP}`);
 }
 
 function loadProgress() {
@@ -215,22 +255,16 @@ function cleanupProgress() {
   }
 }
 
-// ==== 动态调整机制 ====
+// ==== 动态调整机制（已集成到自适应步长中，保留用于兼容性） ====
 function adjustBatchSizeOnTimeout() {
   consecutiveTimeouts++;
   console.log(`[调整] 检测到超时错误，连续超时次数: ${consecutiveTimeouts}`);
   
-  if (consecutiveTimeouts >= 2) {
-    // 减少地址批次大小
-    if (currentAddressChunk > MIN_ADDRESS_CHUNK) {
-      currentAddressChunk = Math.max(MIN_ADDRESS_CHUNK, Math.floor(currentAddressChunk / 2));
-      console.log(`[调整] 地址批次大小调整为: ${currentAddressChunk}`);
-    }
-    
+  if (consecutiveTimeouts >= 3) {
     // 减少区块步长
-    if (currentBlockStep > MIN_BLOCK_STEP && consecutiveTimeouts >= 3) {
-      currentBlockStep = Math.max(MIN_BLOCK_STEP, Math.floor(currentBlockStep / 2));
-      console.log(`[调整] 区块步长调整为: ${currentBlockStep}`);
+    if (BLOCK_STEP > BLOCK_STEP_MIN) {
+      BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
+      console.log(`[调整] 区块步长调整为: ${BLOCK_STEP}`);
     }
   }
 }
@@ -363,12 +397,18 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
       part = savedProgress.part || 1;
       rowsInPart = savedProgress.rowsInPart || 0;
       
+      // 恢复自适应步长
+      if (savedProgress.blockStep) {
+        BLOCK_STEP = savedProgress.blockStep;
+        console.log(`[恢复] 区块步长恢复为 ${BLOCK_STEP}`);
+      }
+      
       // 如果有现有文件，以追加模式打开
       if (rowsInPart > 0) {
         await closePart(current);
         const filePath = path.join(outDir, `edge_events_part${part}.csv`);
         if (fs.existsSync(filePath)) {
-          const stream = fs.createWriteStream(filePath, { flags: "a" }); // 追加模式
+          const stream = fs.createWriteStream(filePath, { flags: "a", highWaterMark: 32 * 1024 * 1024 }); // 追加模式+高水位
           const writer = csv.format({ headers: false }); // 不重复写表头
           writer.pipe(stream);
           current = { path: filePath, stream, writer };
@@ -380,7 +420,9 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
     }
 
     console.log(`[配置] START_BLOCK=${START_BLOCK}, TARGET_END=${TARGET_END_RAW}, FOLLOW_LATEST=${FOLLOW_LATEST}`);
-    console.log(`[配置] BLOCK_STEP=${BLOCK_STEP}, ADDRESS_CHUNK=${ADDRESS_CHUNK}, POLL_INTERVAL=${POLL_INTERVAL_MS}ms`);
+    console.log(`[配置] BLOCK_STEP=${BLOCK_STEP} (范围:${BLOCK_STEP_MIN}-${BLOCK_STEP_MAX}), ADDRESS_CHUNK=${ADDRESS_CHUNK}`);
+    console.log(`[优化] EOA_ONLY=${EOA_ONLY}, USD_THRESHOLD=${USD_THRESHOLD}, INCLUDE_BLOCK_TS=${INCLUDE_BLOCK_TS}`);
+    console.log(`[调整] 步长调整阈值: ${Math.round(STEP_ADJUST_TIME_THRESHOLD/60000)}分钟 或 ${(STEP_ADJUST_LOGS_THRESHOLD/10000).toFixed(0)}万条日志`);
 
     // === 追块主循环：一口气从 START_BLOCK 扫到 TARGET_END（或 latest），然后持续追新块 ===
     while (true) {
@@ -391,7 +433,7 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
 
       // 计算总窗口数（用于进度显示）
       if (targetEnd > nextStart) {
-        totalWindows = Math.ceil(Number(targetEnd - nextStart + 1n) / currentBlockStep);
+        totalWindows = Math.ceil(Number(targetEnd - nextStart + 1n) / BLOCK_STEP);
       } else {
         totalWindows = 0;
       }
@@ -407,37 +449,56 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
         continue;
       }
 
-      const windowEnd = nextStart + BigInt(currentBlockStep - 1) <= targetEnd
-        ? nextStart + BigInt(currentBlockStep - 1)
+      const windowEnd = nextStart + BigInt(BLOCK_STEP - 1) <= targetEnd
+        ? nextStart + BigInt(BLOCK_STEP - 1)
         : targetEnd;
 
-      const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / currentBlockStep) + 1;
+      const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / BLOCK_STEP) + 1;
       console.log(`[扫描] 窗口 ${currentWindow}/${totalWindows} - 区块 ${nextStart}-${windowEnd} (head=${head})`);
-      console.log(`[参数] 当前区块步长: ${currentBlockStep}, 地址批次: ${currentAddressChunk}`);
+      console.log(`[参数] 当前区块步长: ${BLOCK_STEP}, 地址批次: ${ADDRESS_CHUNK}`);
+
+      // === 提速优化：区间级别的统计和CSV管理 ===
+      const t0 = Date.now();
+      let totalLogs = 0;
+      let wrote = 0;
+      const seen = new Set(); // 幂等去重 `${txHash}:${logIndex}`
 
       // === 按地址分片 getLogs → 写 CSV ===
-      const addrBatches = chunks(TOKEN_ADDRESSES, currentAddressChunk);
+      const addrBatches = chunks(TOKEN_ADDRESSES, ADDRESS_CHUNK);
       let startBatch = (nextStart === savedProgress?.nextStart) ? resumeFromBatch : 1;
       
       for (let batchIndex = startBatch - 1; batchIndex < addrBatches.length; batchIndex++) {
         const addrBatch = addrBatches[batchIndex];
-        const batchCount = batchIndex + 1;
-        currentBatch = batchCount; // 更新全局批次变量
+        const batchNum = batchIndex + 1;
+        currentBatch = batchNum; // 更新全局批次变量
         
-        console.log(`  [批次] ${batchCount}/${addrBatches.length} - 查询 ${addrBatch.length} 个Token地址`);
+        console.log(`  [批次] ${batchNum}/${addrBatches.length} - 查询 ${addrBatch.length} 个Token地址`);
         
         try {
           const logs = await withRetry(() => client.getLogs({
             address: addrBatch,
-            event: transferEvent,
+            event: transferEvent,  // viem 会自动生成 topics 并解码 args
             fromBlock: nextStart,
             toBlock: windowEnd,
           }), `getLogs ${nextStart}-${windowEnd} (${addrBatch.length} addrs)`);
 
+          totalLogs += logs.length;
           let validLogs = 0;
           let bloomHits = 0;
           let usdFiltered = 0;
           let eoaFiltered = 0;
+
+          // 可选：批量预取区块时间戳
+          if (INCLUDE_BLOCK_TS && logs.length > 0) {
+            const needBlocks = new Set();
+            for (const l of logs) if (!tsCache.has(Number(l.blockNumber))) needBlocks.add(l.blockNumber);
+            if (needBlocks.size > 0) {
+              await pMap([...needBlocks], async (bn) => {
+                const b = await withRetry(() => client.getBlock({ blockNumber: bn }), 'getBlock');
+                tsCache.set(Number(bn), Number(b.timestamp));
+              }, 4);
+            }
+          }
           
           // 流式处理日志
           for (const log of logs) {
@@ -446,30 +507,51 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             if (!bloom.has(String(from).toLowerCase()) && !bloom.has(String(to).toLowerCase())) continue;
             bloomHits++;
 
+            // 早丢弃：<$100 不落盘
             const u = usd(log.address, value);
             if (u == null || u < USD_THRESHOLD) continue;
             usdFiltered++;
 
-            // ★★★★★ 关键过滤：from/to 只保留 EOA（任一侧非 EOA，则跳过）
-            const bn = log.blockNumber;
-            const [fromIsEOA, toIsEOA] = await Promise.all([
-              isEOAAtBlock(from, bn),
-              isEOAAtBlock(to, bn),
-            ]);
-            if (!fromIsEOA || !toIsEOA) continue;
+            // ★★★★★ EOA过滤（可选）
+            if (EOA_ONLY) {
+              const bn = log.blockNumber;
+              const [fromIsEOA, toIsEOA] = await Promise.all([
+                isEOAAtBlock(from, bn),
+                isEOAAtBlock(to, bn),
+              ]);
+              if (!fromIsEOA || !toIsEOA) continue;
+            }
             eoaFiltered++;
 
-            await writeRow({
+            // 幂等去重
+            const key = `${log.transactionHash}:${Number(log.logIndex)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            // 高水位缓冲写入
+            const ok = current.writer.write({
               tx_hash: log.transactionHash,
               log_index: Number(log.logIndex),
               block_number: Number(log.blockNumber),
-              timestamp: await ts(log.blockNumber),
+              timestamp: INCLUDE_BLOCK_TS ? (tsCache.get(Number(log.blockNumber)) ?? 0) : 0,
               token_address: log.address,
               raw_amount: BigInt(value).toString(10),
               usd_value: u.toFixed(6),
               from, to,
             });
             validLogs++;
+            wrote++;
+            
+            if (!ok) await onceDrain(current.stream); // backpressure
+
+            // 行数检查和文件轮换
+            rowsInPart++;
+            if (rowsInPart >= ROW_LIMIT) {
+              await closePart(current);
+              part++;
+              rowsInPart = 0;
+              current = openNewPart();
+            }
           }
           
           if (logs.length > 0) {
@@ -477,8 +559,8 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           }
           
           // 定期保存进度
-          if (batchCount % CHECKPOINT_INTERVAL === 0) {
-            saveProgress(nextStart, batchCount, totalWindows, targetEnd);
+          if (batchNum % CHECKPOINT_INTERVAL === 0) {
+            saveProgress(nextStart, batchNum, totalWindows, targetEnd);
           }
           
           // 添加请求间隔，避免过于频繁的请求
@@ -487,13 +569,33 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           }
           
         } catch (error) {
-          console.error(`[错误] 批次 ${batchCount} 处理失败: ${error.message}`);
-          saveProgress(nextStart, batchCount, totalWindows, targetEnd);
+          console.error(`[错误] 批次 ${batchNum} 处理失败: ${error.message}`);
+          saveProgress(nextStart, batchNum, totalWindows, targetEnd);
           throw error;
         }
       }
       
-      console.log(`[完成] 区块 ${nextStart}-${windowEnd} 处理完毕`);
+      const dt = Date.now() - t0;
+      
+      // ★★★★★ 自适应步长调整（激进策略）
+      const dtSeconds = Math.round(dt / 1000);
+      const dtMinutes = Math.round(dt / 60000);
+      
+      if (dt > STEP_ADJUST_TIME_THRESHOLD || totalLogs > STEP_ADJUST_LOGS_THRESHOLD) {
+        // 耗时超过1小时 或 日志超过50万条 → 步长减半
+        const oldStep = BLOCK_STEP;
+        BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
+        console.log(`[调整] 区块步长减半 ${oldStep} -> ${BLOCK_STEP} (耗时${dtMinutes}分钟, 日志${totalLogs.toLocaleString()}条)`);
+      } else if (dt < STEP_ADJUST_TIME_THRESHOLD && totalLogs < STEP_ADJUST_LOGS_THRESHOLD) {
+        // 耗时少于1小时 且 日志少于50万条 → 步长增加25%
+        const oldStep = BLOCK_STEP;
+        BLOCK_STEP = Math.min(BLOCK_STEP_MAX, Math.floor(BLOCK_STEP * 1.25));
+        if (BLOCK_STEP !== oldStep) {
+          console.log(`[调整] 区块步长增加 ${oldStep} -> ${BLOCK_STEP} (耗时${dtSeconds}秒, 日志${totalLogs.toLocaleString()}条)`);
+        }
+      }
+      
+      console.log(`[完成] 区块 ${nextStart}-${windowEnd} 处理完毕 | logs=${totalLogs.toLocaleString()} wrote=${wrote} dt=${dtSeconds}s`);
       
       // 移动窗口起点
       nextStart = windowEnd + 1n;

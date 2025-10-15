@@ -7,10 +7,13 @@
 - 🚀 **一键全链扫描**：从创世区块扫描到指定区块
 - 🔄 **断点续传**：支持中断后从上次位置继续
 - 🎯 **精确过滤**：使用 Bloom Filter 高效过滤目标用户
+- 👤 **EOA 识别**：智能过滤合约地址，仅保留 EOA 到 EOA 的转账
 - 💰 **USD 价值计算**：自动计算转账的美元价值
 - 📊 **分片输出**：大文件自动分片，便于处理
 - 🛡️ **健壮性强**：网络重试、错误恢复、优雅退出
 - ⚡ **流式处理**：内存友好，支持大规模数据处理
+- 🎛️ **自适应优化**：区块步长自动调整，性能最优化
+- 📦 **批量传输**：HTTP 批量请求，降低网络延迟
 
 ## 🚀 快速开始
 
@@ -40,7 +43,8 @@ RPC_HTTP=https://bsc-rpc.publicnode.com node scan_bloom.mjs
 
 ```
 bsc-scan/
-├── scan_bloom.mjs          # 主扫描脚本
+├── scan_bloom.mjs          # 主扫描脚本（带 EOA 过滤和提速优化）
+├── eoa.mjs                 # EOA/合约地址判定模块
 ├── build_bloom.mjs         # Bloom Filter 构建脚本
 ├── start_scan.bat          # Windows 启动脚本
 ├── start_scan.sh           # Linux/Mac 启动脚本
@@ -59,8 +63,13 @@ bsc-scan/
 | `START_BLOCK` | `0` | 扫描起始区块号 |
 | `TARGET_END` | `latest` | 目标终点区块号 |
 | `FOLLOW_LATEST` | `1` | 是否持续追踪新区块 |
-| `BLOCK_STEP` | `5000` | 每次查询的区块范围 |
+| `BLOCK_STEP` | `5000` | 初始区块步长（自适应） |
+| `BLOCK_STEP_MIN` | `256` | 最小区块步长 |
+| `BLOCK_STEP_MAX` | `10000` | 最大区块步长 |
 | `ADDRESS_CHUNK` | `10` | 每次查询的地址数量 |
+| `USD_THRESHOLD` | `100` | USD 过滤阈值 |
+| `EOA_ONLY` | `1` | 只保留 EOA 转账 |
+| `INCLUDE_BLOCK_TS` | `0` | 是否包含区块时间戳 |
 | `RPC_HTTP` | - | BSC 节点 RPC 地址 |
 
 ## 📊 输出格式
