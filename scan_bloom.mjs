@@ -18,24 +18,17 @@ const __dirname = path.dirname(__filename);
 
 // ==== 参数 ====
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
-const START_BLOCK = Number(process.env.START_BLOCK ?? 6000000);
+const START_BLOCK = Number(process.env.START_BLOCK ?? 6011531);
 const END_BLOCK   = Number(process.env.END_BLOCK   ?? 500_000);
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 40);
 const ROW_LIMIT = Number(process.env.ROW_LIMIT || 5_000_000);
 
 // ==== 提速优化参数 ====
-let   BLOCK_STEP      = Number(process.env.BLOCK_STEP || 2000);    // 自适应步长初始值
-const BLOCK_STEP_MIN  = Number(process.env.BLOCK_STEP_MIN || 1500); // 最小步长
-const BLOCK_STEP_MAX  = Number(process.env.BLOCK_STEP_MAX || 5000); // 最大步长
+const BLOCK_STEP      = Number(process.env.BLOCK_STEP || 2000);    // 固定步长
 const ADDRESS_CHUNK   = Number(process.env.ADDRESS_CHUNK || 10);   // address下推分片
 const USD_THRESHOLD   = Number(process.env.USD_THRESHOLD || 100);  // <$100早丢弃
 const EOA_ONLY        = String(process.env.EOA_ONLY || "1") === "1"; // 只保留EOA
 const INCLUDE_BLOCK_TS = String(process.env.INCLUDE_BLOCK_TS || "0") === "0"; // 是否查询块时间
-
-// 自适应步长调整阈值
-const STEP_ADJUST_TIME_THRESHOLD = Number(process.env.STEP_ADJUST_TIME_MS || 3600000); // 1小时 = 3600000ms
-const STEP_ADJUST_LOGS_THRESHOLD = Number(process.env.STEP_ADJUST_LOGS || 500000); // 50万条日志
-const STEP_ADJUST_WINDOW_COUNT = Number(process.env.STEP_ADJUST_WINDOW_COUNT || 20); // 每20个窗口检查一次步长调整
 
 // === 新增：追块&终点 ===
 const FOLLOW_LATEST = String(process.env.FOLLOW_LATEST || "0") === "1"; // 扫完一轮后是否继续追新块
@@ -51,8 +44,7 @@ const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // �
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3); // 最大重试次数
 const RETRY_DELAY_BASE = Number(process.env.RETRY_DELAY_BASE || 1000); // 重试延迟基数（毫秒）
 
-// 动态调整参数（保留旧逻辑兼容）
-let consecutiveTimeouts = 0;  // 连续超时计数
+// 动态调整参数
 const REQUEST_DELAY = Number(process.env.REQUEST_DELAY || 100); // 请求间隔（毫秒）
 
 // ==== 流式读取 Token 数据 ====
@@ -262,8 +254,7 @@ function saveProgress(nextStart, currentBatch, totalWindows, targetEnd) {
     startBlock: START_BLOCK,
     targetEnd: targetEnd.toString(),
     part,
-    rowsInPart,
-    blockStep: BLOCK_STEP // 保存当前步长
+    rowsInPart
   };
   fs.writeFileSync(PROGRESS_FILE, JSON.stringify(progress, null, 2));
   const currentWindow = Math.floor(Number(nextStart - BigInt(START_BLOCK)) / BLOCK_STEP) + 1;
@@ -298,26 +289,6 @@ function cleanupProgress() {
   }
 }
 
-// ==== 动态调整机制（已集成到自适应步长中，保留用于兼容性） ====
-function adjustBatchSizeOnTimeout() {
-  consecutiveTimeouts++;
-  console.log(`[调整] 检测到超时错误，连续超时次数: ${consecutiveTimeouts}`);
-  
-  if (consecutiveTimeouts >= 3) {
-    // 减少区块步长
-    if (BLOCK_STEP > BLOCK_STEP_MIN) {
-      BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
-      console.log(`[调整] 区块步长调整为: ${BLOCK_STEP}`);
-    }
-  }
-}
-
-function resetTimeoutCounter() {
-  if (consecutiveTimeouts > 0) {
-    console.log(`[调整] 请求成功，重置超时计数器`);
-    consecutiveTimeouts = 0;
-  }
-}
 
 // ==== 增强的重试机制 ====
 async function withRetry(fn, label, max = MAX_RETRIES) {
@@ -325,7 +296,6 @@ async function withRetry(fn, label, max = MAX_RETRIES) {
   for (let i = 0; i < max; i++) {
     try { 
       const result = await fn();
-      resetTimeoutCounter(); // 成功时重置超时计数器
       return result;
     } catch (e) {
       err = e;
@@ -335,9 +305,8 @@ async function withRetry(fn, label, max = MAX_RETRIES) {
       
       console.warn(`[重试 ${i + 1}/${max}] ${label}: ${e?.message || e}; 等待 ${Math.round(totalDelay)}ms`);
       
-      // 检测超时错误并调整批次大小
+      // 根据不同错误类型调整等待时间
       if (e?.message?.includes('timeout') || e?.message?.includes('took too long')) {
-        adjustBatchSizeOnTimeout();
         await new Promise(r => setTimeout(r, totalDelay * 2)); // 超时错误等待更长时间
       } else if (e?.message?.includes('rate limit') || e?.code === 429) {
         await new Promise(r => setTimeout(r, totalDelay * 3)); // 速率限制时等待更长时间
@@ -386,10 +355,6 @@ let nextStart = BigInt(START_BLOCK);
 let totalWindows = 0;
 let currentBatch = 1;
 let targetEnd = BigInt(0);
-
-// ==== 步长调整统计 ====
-let windowsProcessed = 0; // 已处理窗口数
-let windowStats = []; // 窗口统计数据：{ time, logs }
 
 process.on('SIGINT', async () => {
   if (isShuttingDown) {
@@ -458,12 +423,6 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
       part = savedProgress.part || 1;
       rowsInPart = savedProgress.rowsInPart || 0;
       
-      // 恢复自适应步长
-      if (savedProgress.blockStep) {
-        BLOCK_STEP = savedProgress.blockStep;
-        console.log(`[恢复] 区块步长恢复为 ${BLOCK_STEP}`);
-      }
-      
       // 如果有现有文件，以追加模式打开
       if (rowsInPart > 0) {
         await closePart(current);
@@ -481,9 +440,8 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
     }
 
     console.log(`[配置] START_BLOCK=${START_BLOCK}, TARGET_END=${TARGET_END_RAW}, FOLLOW_LATEST=${FOLLOW_LATEST}`);
-    console.log(`[配置] BLOCK_STEP=${BLOCK_STEP} (范围:${BLOCK_STEP_MIN}-${BLOCK_STEP_MAX}), ADDRESS_CHUNK=${ADDRESS_CHUNK}`);
+    console.log(`[配置] BLOCK_STEP=${BLOCK_STEP} (固定步长), ADDRESS_CHUNK=${ADDRESS_CHUNK}`);
     console.log(`[优化] EOA_ONLY=${EOA_ONLY}, USD_THRESHOLD=${USD_THRESHOLD}, INCLUDE_BLOCK_TS=${INCLUDE_BLOCK_TS}`);
-    console.log(`[调整] 步长调整阈值: ${Math.round(STEP_ADJUST_TIME_THRESHOLD/60000)}分钟 或 ${(STEP_ADJUST_LOGS_THRESHOLD/10000).toFixed(0)}万条日志`);
 
     // === 追块主循环：一口气从 START_BLOCK 扫到 TARGET_END（或 latest），然后持续追新块 ===
     while (true) {
@@ -677,45 +635,8 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
       }
       
       const dt = Date.now() - t0;
-      
-      // 记录窗口统计
-      windowsProcessed++;
-      windowStats.push({ time: dt, logs: totalLogs });
-      
-      // 只保留最近 STEP_ADJUST_WINDOW_COUNT 个窗口的统计
-      if (windowStats.length > STEP_ADJUST_WINDOW_COUNT) {
-        windowStats.shift();
-      }
-      
       const dtSeconds = Math.round(dt / 1000);
       console.log(`[完成] 区块 ${nextStart}-${windowEnd} 处理完毕 | logs=${totalLogs.toLocaleString()} wrote=${wrote} dt=${dtSeconds}s`);
-      
-      // ★★★★★ 自适应步长调整（每15个窗口检查一次）
-      if (windowsProcessed % STEP_ADJUST_WINDOW_COUNT === 0 && windowStats.length === STEP_ADJUST_WINDOW_COUNT) {
-        // 计算最近15个窗口的平均耗时和日志数
-        const avgTime = windowStats.reduce((sum, s) => sum + s.time, 0) / windowStats.length;
-        const avgLogs = windowStats.reduce((sum, s) => sum + s.logs, 0) / windowStats.length;
-        const avgMinutes = Math.round(avgTime / 30000);
-        const avgSeconds = Math.round(avgTime / 1000);
-        
-        console.log(`[统计] 最近${STEP_ADJUST_WINDOW_COUNT}个窗口 - 平均耗时: ${avgSeconds}秒, 平均日志: ${Math.round(avgLogs).toLocaleString()}条`);
-        
-        if (avgTime > STEP_ADJUST_TIME_THRESHOLD || avgLogs > STEP_ADJUST_LOGS_THRESHOLD) {
-          // 平均耗时超过30分钟 或 平均日志超过50万条 → 步长减半
-          const oldStep = BLOCK_STEP;
-          BLOCK_STEP = Math.max(BLOCK_STEP_MIN, Math.floor(BLOCK_STEP / 2));
-          console.log(`[调整] 区块步长减半 ${oldStep} -> ${BLOCK_STEP} (平均${avgMinutes}分钟, ${Math.round(avgLogs).toLocaleString()}条日志)`);
-          windowStats = []; // 清空统计，重新开始
-        } else if (avgTime < STEP_ADJUST_TIME_THRESHOLD / 2 && avgLogs < STEP_ADJUST_LOGS_THRESHOLD / 2) {
-          // 平均耗时少于30分钟 且 平均日志少于25万条 → 步长增加25%
-          const oldStep = BLOCK_STEP;
-          BLOCK_STEP = Math.min(BLOCK_STEP_MAX, Math.floor(BLOCK_STEP * 1.25));
-          if (BLOCK_STEP !== oldStep) {
-            console.log(`[调整] 区块步长增加 ${oldStep} -> ${BLOCK_STEP} (平均${avgSeconds}秒, ${Math.round(avgLogs).toLocaleString()}条日志)`);
-            windowStats = []; // 清空统计，重新开始
-          }
-        }
-      }
       
       // 移动窗口起点
       nextStart = windowEnd + 1n;
