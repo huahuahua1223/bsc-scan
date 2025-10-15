@@ -45,6 +45,7 @@ const TARGET_END_RAW = process.env.TARGET_END || "62530100";
 const TOKENS_CSV = process.env.TOKENS_CSV || "./token_withbalance.csv";
 const BLOOM_JSON = process.env.BLOOM_JSON || "./userlist.bloom.json";
 const PROGRESS_FILE = process.env.PROGRESS_FILE || "./scan_progress.json";
+const FAILED_BATCHES_FILE = process.env.FAILED_BATCHES_FILE || "./failed_batches.json"; // 失败批次记录文件
 const CHECKPOINT_INTERVAL = Number(process.env.CHECKPOINT_INTERVAL || 50); // 每50个批次保存一次进度
 const MAX_RETRIES = Number(process.env.MAX_RETRIES || 5); // 最大重试次数
 const RETRY_DELAY_BASE = Number(process.env.RETRY_DELAY_BASE || 1000); // 重试延迟基数（毫秒）
@@ -209,6 +210,47 @@ async function pMap(items, worker, concurrency = 4) {
   });
 }
 
+// ==== 失败批次记录相关函数 ====
+function saveFailedBatch(blockRange, batchNum, addressCount, error) {
+  let failedBatches = [];
+  if (fs.existsSync(FAILED_BATCHES_FILE)) {
+    try {
+      failedBatches = JSON.parse(fs.readFileSync(FAILED_BATCHES_FILE, 'utf8'));
+    } catch (e) {
+      console.warn(`[警告] 读取失败批次文件出错: ${e.message}`);
+    }
+  }
+  
+  failedBatches.push({
+    blockRange,
+    batchNum,
+    addressCount,
+    error: error?.message || String(error),
+    timestamp: new Date().toISOString(),
+    attemptedSteps: [] // 记录尝试过的步长
+  });
+  
+  fs.writeFileSync(FAILED_BATCHES_FILE, JSON.stringify(failedBatches, null, 2));
+  console.error(`[失败记录] 已记录失败批次到 ${FAILED_BATCHES_FILE}`);
+}
+
+function updateFailedBatchSteps(blockRange, batchNum, step) {
+  if (!fs.existsSync(FAILED_BATCHES_FILE)) return;
+  
+  try {
+    const failedBatches = JSON.parse(fs.readFileSync(FAILED_BATCHES_FILE, 'utf8'));
+    const lastBatch = failedBatches[failedBatches.length - 1];
+    
+    if (lastBatch && lastBatch.blockRange === blockRange && lastBatch.batchNum === batchNum) {
+      if (!lastBatch.attemptedSteps) lastBatch.attemptedSteps = [];
+      lastBatch.attemptedSteps.push(step);
+      fs.writeFileSync(FAILED_BATCHES_FILE, JSON.stringify(failedBatches, null, 2));
+    }
+  } catch (e) {
+    console.warn(`[警告] 更新失败批次记录出错: ${e.message}`);
+  }
+}
+
 // ==== 断点续传相关函数 ====
 function saveProgress(nextStart, currentBatch, totalWindows, targetEnd) {
   const progress = {
@@ -310,6 +352,65 @@ async function withRetry(fn, label, max = MAX_RETRIES) {
   
   console.error(`[失败] ${label} 在 ${max} 次重试后仍然失败`);
   throw err;
+}
+
+// ==== 带步长回退的批次重试机制 ====
+async function retryBatchWithStepBackoff(batchFn, blockRange, batchNum, addressCount, originalStep) {
+  let currentStep = originalStep;
+  const testedSteps = []; // 记录尝试过的步长
+  
+  while (currentStep >= BLOCK_STEP_MIN) {
+    try {
+      console.log(`[批次重试] 尝试步长 ${currentStep} (原步长: ${originalStep}, 最小: ${BLOCK_STEP_MIN})`);
+      testedSteps.push(currentStep);
+      
+      // 临时修改全局步长用于此批次
+      const savedStep = BLOCK_STEP;
+      BLOCK_STEP = currentStep;
+      
+      try {
+        const result = await batchFn();
+        BLOCK_STEP = savedStep; // 恢复步长
+        
+        // 成功后，如果步长被调整过，更新全局步长为成功的步长
+        if (currentStep < originalStep) {
+          console.log(`[步长调整] 批次成功，将步长从 ${savedStep} 调整为 ${currentStep}`);
+        }
+        
+        return result; // 成功返回
+      } catch (e) {
+        BLOCK_STEP = savedStep; // 确保恢复步长
+        throw e;
+      }
+      
+    } catch (error) {
+      console.error(`[批次重试失败] 步长 ${currentStep} 失败: ${error.message}`);
+      
+      // 记录尝试过的步长
+      updateFailedBatchSteps(blockRange, batchNum, currentStep);
+      
+      // 步长减半，继续重试
+      const nextStep = Math.floor(currentStep / 2);
+      
+      if (nextStep < BLOCK_STEP_MIN) {
+        // 已经到达最小步长，仍然失败
+        console.error(`[批次放弃] 已尝试所有步长 [${testedSteps.join(', ')}]，最终失败`);
+        
+        // 记录失败批次
+        saveFailedBatch(blockRange, batchNum, addressCount, error);
+        
+        return null; // 返回 null 表示失败，需要跳过
+      }
+      
+      currentStep = nextStep;
+      console.log(`[步长回退] 减小步长到 ${currentStep}，继续重试...`);
+      
+      // 等待一段时间后再重试
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+  
+  return null; // 不应该到这里，但以防万一
 }
 
 // ==== 健康检查和自动恢复 ====
@@ -474,14 +575,49 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
         
         console.log(`  [批次] ${batchNum}/${addrBatches.length} - 查询 ${addrBatch.length} 个Token地址`);
         
-        try {
-          const logs = await withRetry(() => client.getLogs({
+        const blockRange = `${nextStart}-${windowEnd}`;
+        
+        // 定义批次处理函数
+        const processBatch = async () => {
+          return await withRetry(() => client.getLogs({
             address: addrBatch,
             event: transferEvent,  // viem 会自动生成 topics 并解码 args
             fromBlock: nextStart,
             toBlock: windowEnd,
           }), `getLogs ${nextStart}-${windowEnd} (${addrBatch.length} addrs)`);
+        };
+        
+        let logs;
+        try {
+          // 首先尝试正常处理
+          logs = await processBatch();
+        } catch (error) {
+          // 如果正常重试失败，启用步长回退机制
+          console.warn(`[批次失败] 批次 ${batchNum} 常规重试失败，启用步长回退机制`);
+          
+          const result = await retryBatchWithStepBackoff(
+            processBatch,
+            blockRange,
+            batchNum,
+            addrBatch.length,
+            BLOCK_STEP
+          );
+          
+          if (result === null) {
+            // 所有重试都失败了，跳过这个批次
+            console.error(`[跳过批次] 批次 ${batchNum} (${blockRange}) 已跳过，继续处理下一个批次`);
+            
+            // 定期保存进度
+            if (batchNum % CHECKPOINT_INTERVAL === 0) {
+              saveProgress(nextStart, batchNum + 1, totalWindows, targetEnd);
+            }
+            continue; // 跳过当前批次，继续下一个
+          }
+          
+          logs = result;
+        }
 
+        try {
           totalLogs += logs.length;
           let validLogs = 0;
           let bloomHits = 0;
@@ -569,9 +705,15 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           }
           
         } catch (error) {
-          console.error(`[错误] 批次 ${batchNum} 处理失败: ${error.message}`);
+          console.error(`[错误] 批次 ${batchNum} 数据处理失败: ${error.message}`);
+          console.error(`[错误堆栈] ${error.stack}`);
+          
+          // 保存进度并记录失败
           saveProgress(nextStart, batchNum, totalWindows, targetEnd);
-          throw error;
+          saveFailedBatch(blockRange, batchNum, addrBatch.length, error);
+          
+          console.warn(`[继续] 批次 ${batchNum} 处理出错，已记录失败并继续下一个批次`);
+          // 不再抛出错误，而是继续处理下一个批次
         }
       }
       
@@ -613,6 +755,34 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
     await closePart(current);
     cleanupProgress();
     console.log(`[完成] 扫描完成，共生成 ${part} 个文件`);
+    
+    // 输出失败批次统计
+    if (fs.existsSync(FAILED_BATCHES_FILE)) {
+      try {
+        const failedBatches = JSON.parse(fs.readFileSync(FAILED_BATCHES_FILE, 'utf8'));
+        if (failedBatches.length > 0) {
+          console.log(`\n========== 失败批次统计 ==========`);
+          console.log(`共有 ${failedBatches.length} 个批次失败`);
+          console.log(`详细信息已保存至: ${FAILED_BATCHES_FILE}`);
+          console.log(`\n失败批次列表:`);
+          failedBatches.forEach((batch, index) => {
+            console.log(`  ${index + 1}. 区块范围: ${batch.blockRange}, 批次: ${batch.batchNum}, 地址数: ${batch.addressCount}`);
+            if (batch.attemptedSteps && batch.attemptedSteps.length > 0) {
+              console.log(`     尝试步长: [${batch.attemptedSteps.join(', ')}]`);
+            }
+            console.log(`     错误: ${batch.error}`);
+            console.log(`     时间: ${batch.timestamp}`);
+          });
+          console.log(`===================================\n`);
+        } else {
+          console.log(`[完成] 所有批次均成功处理，无失败记录`);
+        }
+      } catch (e) {
+        console.warn(`[警告] 读取失败批次统计出错: ${e.message}`);
+      }
+    } else {
+      console.log(`[完成] 所有批次均成功处理，无失败记录`);
+    }
     
   } catch (error) {
     console.error(`[致命错误] ${error.message}`);
