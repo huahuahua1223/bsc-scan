@@ -12,13 +12,13 @@ import csv from "fast-csv";
 import bloomPkg from "bloom-filters";
 import { makeEOAChecker } from './eoa.mjs';
 
-const { BloomFilter } = bloomPkg;
+const { PartitionedBloomFilter } = bloomPkg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // ==== 参数 ====
 const RPC_HTTP = process.env.RPC_HTTP || "http://127.0.0.1:8545";
-const START_BLOCK = Number(process.env.START_BLOCK ?? 6011531);
+const START_BLOCK = Number(process.env.START_BLOCK ?? 6000000);
 const END_BLOCK   = Number(process.env.END_BLOCK   ?? 500_000);
 const CONFIRMATIONS = Number(process.env.CONFIRMATIONS || 40);
 const ROW_LIMIT = Number(process.env.ROW_LIMIT || 5_000_000);
@@ -78,7 +78,7 @@ if (!fs.existsSync(BLOOM_JSON)) {
   console.error(`Bloom not found: ${BLOOM_JSON}`);
   process.exit(1);
 }
-const bloom = BloomFilter.fromJSON(JSON.parse(fs.readFileSync(BLOOM_JSON, "utf8")));
+const bloom = PartitionedBloomFilter.fromJSON(JSON.parse(fs.readFileSync(BLOOM_JSON, "utf8")));
 
 // ==== viem client ====
 const bsc = defineChain({
@@ -144,6 +144,9 @@ async function writeRow(row) {
 }
 
 // ==== 工具 ====
+// 地址规范化：统一小写和trim
+const normalizeAddr = (addr) => (addr ?? '').toString().trim().toLowerCase();
+
 function chunks(arr, n) { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; }
 
 // 解析目标终点区块号
@@ -556,8 +559,11 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
           // 流式处理日志
           for (const log of logs) {
             const { from, to, value } = log.args;
+            // 规范化地址
+            const fromNorm = normalizeAddr(from);
+            const toNorm = normalizeAddr(to);
             // 只要 from/to 命中 user_list（Bloom），就保留
-            if (!bloom.has(String(from).toLowerCase()) && !bloom.has(String(to).toLowerCase())) continue;
+            if (!bloom.has(fromNorm) && !bloom.has(toNorm)) continue;
             bloomHits++;
 
             // 早丢弃：<$100 不落盘
@@ -581,16 +587,17 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             if (seen.has(key)) continue;
             seen.add(key);
 
-            // 高水位缓冲写入
+            // 高水位缓冲写入（确保地址全部小写）
             const ok = current.writer.write({
               tx_hash: log.transactionHash,
               log_index: Number(log.logIndex),
               block_number: Number(log.blockNumber),
               timestamp: INCLUDE_BLOCK_TS ? (tsCache.get(Number(log.blockNumber)) ?? 0) : 0,
-              token_address: log.address,
+              token_address: normalizeAddr(log.address),
               raw_amount: BigInt(value).toString(10),
               usd_value: u.toFixed(6),
-              from, to,
+              from: fromNorm,
+              to: toNorm,
             });
             validLogs++;
             wrote++;
