@@ -608,24 +608,35 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             // 根据 Bloom 命中情况，写入一行或两行
             const rowsToWrite = [];
             
-            if (fromInBloom) {
-              // from 命中：用户发出
+            // 特殊情况：自转账（from == to）
+            if (fromNorm === toNorm && fromInBloom) {
               rowsToWrite.push({
                 ...baseRow,
                 user_address: fromNorm,
-                counterparty_address: toNorm,
-                direction_flag: 1, // out
-              });
-            }
-            
-            if (toInBloom) {
-              // to 命中：用户接收
-              rowsToWrite.push({
-                ...baseRow,
-                user_address: toNorm,
                 counterparty_address: fromNorm,
-                direction_flag: 0, // in
+                direction_flag: 2, // self
               });
+            } else {
+              // 正常情况：from 和 to 不同
+              if (fromInBloom) {
+                // from 命中：用户发出
+                rowsToWrite.push({
+                  ...baseRow,
+                  user_address: fromNorm,
+                  counterparty_address: toNorm,
+                  direction_flag: 1, // out
+                });
+              }
+              
+              if (toInBloom) {
+                // to 命中：用户接收
+                rowsToWrite.push({
+                  ...baseRow,
+                  user_address: toNorm,
+                  counterparty_address: fromNorm,
+                  direction_flag: 0, // in
+                });
+              }
             }
 
             // 写入所有行
