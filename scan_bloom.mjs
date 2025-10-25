@@ -562,8 +562,13 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             // 规范化地址
             const fromNorm = normalizeAddr(from);
             const toNorm = normalizeAddr(to);
+            
+            // 判断哪些地址命中 Bloom
+            const fromInBloom = bloom.has(fromNorm);
+            const toInBloom = bloom.has(toNorm);
+            
             // 只要 from/to 命中 user_list（Bloom），就保留
-            if (!bloom.has(fromNorm) && !bloom.has(toNorm)) continue;
+            if (!fromInBloom && !toInBloom) continue;
             bloomHits++;
 
             // 早丢弃：<$100 不落盘
@@ -587,8 +592,8 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
             if (seen.has(key)) continue;
             seen.add(key);
 
-            // 高水位缓冲写入（确保地址全部小写）
-            const ok = current.writer.write({
+            // 基础行数据
+            const baseRow = {
               tx_hash: log.transactionHash,
               log_index: Number(log.logIndex),
               block_number: Number(log.blockNumber),
@@ -598,19 +603,47 @@ setInterval(logMemoryUsage, 5 * 60 * 1000);
               usd_value: u.toFixed(6),
               from: fromNorm,
               to: toNorm,
-            });
-            validLogs++;
-            wrote++;
-            
-            if (!ok) await onceDrain(current.stream); // backpressure
+            };
 
-            // 行数检查和文件轮换
-            rowsInPart++;
-            if (rowsInPart >= ROW_LIMIT) {
-              await closePart(current);
-              part++;
-              rowsInPart = 0;
-              current = openNewPart();
+            // 根据 Bloom 命中情况，写入一行或两行
+            const rowsToWrite = [];
+            
+            if (fromInBloom) {
+              // from 命中：用户发出
+              rowsToWrite.push({
+                ...baseRow,
+                user_address: fromNorm,
+                counterparty_address: toNorm,
+                direction_flag: 1, // out
+              });
+            }
+            
+            if (toInBloom) {
+              // to 命中：用户接收
+              rowsToWrite.push({
+                ...baseRow,
+                user_address: toNorm,
+                counterparty_address: fromNorm,
+                direction_flag: 0, // in
+              });
+            }
+
+            // 写入所有行
+            for (const row of rowsToWrite) {
+              const ok = current.writer.write(row);
+              validLogs++;
+              wrote++;
+              
+              if (!ok) await onceDrain(current.stream); // backpressure
+
+              // 行数检查和文件轮换
+              rowsInPart++;
+              if (rowsInPart >= ROW_LIMIT) {
+                await closePart(current);
+                part++;
+                rowsInPart = 0;
+                current = openNewPart();
+              }
             }
           }
           
